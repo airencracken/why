@@ -14,12 +14,14 @@ no warnings 'experimental';
 # Strategy (based on empirical testing):
 #   Function defs: use raw bytes in output    —  raw_bytes() { ... }
 #   Function calls: use raw bytes in output   —  raw_bytes args
-#   Variable store: associative array ___     —  ___[$'\xHH']=value
-#   Variable read:  indirect expansion        —  ${___[$'\xHH']}
+#   Variable store: associative array _     —  _[raw_bytes]=value
+#   Variable read:  array subscript           —  ${_[raw_bytes]}
 #
-# Why raw bytes for functions: bash rejects $'\xNN'(){} syntax at parse time
-# because expansion happens after the parser checks for valid identifier names.
-# Raw bytes embedded in the source file pass the parser's identifier check.
+# Why raw bytes: bash rejects $'\xNN'(){} for function definitions at parse
+# time, and rejects control/unicode characters in variable names entirely
+# (declare/printf-v/read all fail with "not a valid identifier").
+# But raw bytes embedded directly in associative array subscript brackets
+# works for both storage and retrieval.
 
 use Getopt::Long;
 
@@ -101,6 +103,41 @@ sub name_codepoint_count {
 	my $decoded = $name;
 	utf8::decode($decoded);
 	return scalar( () = unpack( 'U*', $decoded ) );
+}
+
+# Generate a random short bash identifier for the associative array.
+# Avoids collisions with builtins, reserved vars, and user identifiers.
+sub gen_array_name {
+	my ( $funcs, $vars ) = @_;
+
+	# Characters for the name: [_a-zA-Z] for first char, [_a-zA-Z0-9] for rest
+	my @first = ( '_', 'a' .. 'z', 'A' .. 'Z' );
+	my @rest  = ( '_', 'a' .. 'z', 'A' .. 'Z', 0 .. 9 );
+
+	# Collect all names to avoid
+	my %avoid;
+	$avoid{$_} = 1 for keys %$funcs;
+	$avoid{$_} = 1 for keys %$vars;
+	# Also avoid single-char names that bash uses
+	for ( '_', '@', '?', '!', '#', '$', '-', 0 .. 9 ) {
+		$avoid{$_} = 1;
+	}
+
+	# Try up to 3-character names, increasing length if needed
+	for my $len ( 1 .. 4 ) {
+		for ( 1 .. 500 ) {
+			my $name = $first[ rand @first ];
+			for ( 2 .. $len ) {
+				$name .= $rest[ rand @rest ];
+			}
+			next if $avoid{$name};
+			# Must not be a bash keyword
+			next if $name =~ /^(if|then|else|elif|fi|case|esac|for|while|until|do|done|in|function|select|time|coproc)$/;
+			return $name;
+		}
+	}
+	# Fallback: something guaranteed unique
+	return '_' . int( rand(10000) );
 }
 
 sub read_all {
@@ -244,13 +281,14 @@ sub generate_names {
 # ── transformation ─────────────────────────────────────────────────────────────
 
 sub transform {
-	my ( $src, $funcs, $vars, $map ) = @_;
+	my ( $src, $funcs, $vars, $map, $aname ) = @_;
 
 	my $out = $src;
+	my $A = $aname;    # short alias for interpolation
 
 	# ── insert preamble (associative array for variable storage) ──
 	if ( scalar keys %$vars ) {
-		my $preamble = "declare -A ___=()\n";
+		my $preamble = "declare -A $A=()\n";
 		if ( $out =~ s/^(#!.*\n)/$1$preamble/ ) {
 			# inserted after shebang
 		} else {
@@ -264,22 +302,21 @@ sub transform {
 
 	for my $vname (@vnames) {
 		my $raw = $map->{$vname};
-		my $esc = bytes_to_escape($raw);
 
-		# 1a. ${#var} prefix-length → ${#___[$esc]}
-		$out =~ s/\$\{#${vname}\}/\$\{#___\[${esc}\]\}/g;
+		# 1a. ${#var} prefix-length → ${#A[raw]}
+		$out =~ s/\$\{#${vname}\}/\$\{#${A}\[${raw}\]\}/g;
 
-		# 1b. ${var} with suffix → ${___[$esc]suffix}
-		$out =~ s/\$\{${vname}([:#%\/\^,,\@\*\[][^}]*)\}/\$\{___\[${esc}\]$1\}/g;
+		# 1b. ${var} with suffix → ${A[raw]suffix}
+		$out =~ s/\$\{${vname}([:#%\/\^,,\@\*\[][^}]*)\}/\$\{${A}\[${raw}\]$1\}/g;
 
-		# 1c. ${var} without suffix → ${___[$esc]}
-		$out =~ s/\$\{${vname}\}/\$\{___\[${esc}\]\}/g;
+		# 1c. ${var} without suffix → ${A[raw]}
+		$out =~ s/\$\{${vname}\}/\$\{${A}\[${raw}\]\}/g;
 
-		# 2. $var → ${___[$esc]}  (exclude trailing word chars and { only)
-		$out =~ s/(?<![\\\w])\$${vname}(?![\w\{])/\$\{___\[${esc}\]\}/g;
+		# 2. $var → ${A[raw]}  (exclude trailing word chars and { only)
+		$out =~ s/(?<![\\\w])\$${vname}(?![\w\{])/\$\{${A}\[${raw}\]\}/g;
 
-		# 3a.  local/declare/typeset/export/readonly var=value  →  ___[$esc]=value
-		#      Strip the declaration keyword since ___ is already declared.
+		# 3a.  local/declare/typeset/export/readonly var=value  →  A[raw]=value
+		#      Strip the declaration keyword since A is already declared.
 		$out =~ s/
 			(                                      # $1: statement boundary
 				(?:^|[;&\|\n])
@@ -292,22 +329,22 @@ sub transform {
 			)
 			[ \t]*
 			${vname}=
-		/${1}___\[${esc}\]=/gmx;
+		/${1}${A}\[${raw}\]=/gmx;
 
-		# 3b. Plain var=value at statement boundary → ___[$esc]=value
+		# 3b. Plain var=value at statement boundary → A[raw]=value
 		$out =~ s/
 			(
 				(?:^|[;&\|\n])
 				[ \t]*
 			)
 			${vname}=
-		/${1}___\[${esc}\]=/gmx;
+		/${1}${A}\[${raw}\]=/gmx;
 
 		# 3c. Assignment inside subshell at statement boundary: ( var=value ... )
-		$out =~ s/((?:^|[;&\|\n])\([ \t]*)${vname}=/${1}___\[${esc}\]=/gm;
+		$out =~ s/((?:^|[;&\|\n])\([ \t]*)${vname}=/${1}${A}\[${raw}\]=/gm;
 
-		# 4. var+=value  →  ___[$esc]+=value
-		$out =~ s/((?:^|[;&\|\n])[ \t]*)${vname}\+=/${1}___\[${esc}\]+=/gm;
+		# 4. var+=value  →  A[raw]+=value
+		$out =~ s/((?:^|[;&\|\n])[ \t]*)${vname}\+=/${1}${A}\[${raw}\]+=/gm;
 
 		# 5. for varname in ...  →  for _ref in ... (handle separately since for-loop var
 		#    receives values, we store with declare)
@@ -315,10 +352,10 @@ sub transform {
 
 		# 6. bare var in $((arithmetic))  — not needed since $var already handled
 		#    But inside ((...)) without $, like (( var++ ))
-		$out =~ s/(?<=\(\([^\)]{0,120})\b${vname}\b(?![\w\[\'])/\$\{___\[${esc}\]\}/g;
+		$out =~ s/(?<=\(\([^\)]{0,120})\b${vname}\b(?![\w\[\'])/\$\{${A}\[${raw}\]\}/g;
 
 		# 7. bare var in [[ test ]]
-		$out =~ s/(?<=\[\[[^\]]{0,120})\b${vname}\b(?![\w\[\'])/\$\{___\[${esc}\]\}/g;
+		$out =~ s/(?<=\[\[[^\]]{0,120})\b${vname}\b(?![\w\[\'])/\$\{${A}\[${raw}\]\}/g;
 	}
 
 	# ── function transformations ──
@@ -393,15 +430,17 @@ if ( !keys %$funcs && !keys %$vars ) {
 }
 
 my $map = generate_names( $funcs, $vars );
+my $aname = gen_array_name( $funcs, $vars );
 
 # Report mapping to stderr in readable form (skip if -q)
 if ( !$quiet ) {
 	print STDERR "# obfuscated identifiers (mode=$mode):\n";
+	print STDERR "#   array name: $aname\n";
 	for my $id ( sort keys %$map ) {
 		my $kind = $funcs->{$id} ? "func" : "var ";
 		printf STDERR "#   %s: %-20s -> %s\n", $kind, $id, bytes_to_escape( $map->{$id} );
 	}
 }
 
-my $out = transform( $src, $funcs, $vars, $map );
+my $out = transform( $src, $funcs, $vars, $map, $aname );
 print $out;

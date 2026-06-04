@@ -32,7 +32,7 @@ my $quiet  = 0;
 GetOptions(
 	'mode=s'  => \$mode,
 	'quiet|q' => \$quiet,
-) or die "Usage: $0 [--mode=control|unicode|both] [-q|--quiet]\n";
+) or die "Usage: $0 [--mode=control|unicode|both] [-q|--quiet] [file]\n";
 die "Invalid mode: $mode\n" unless $mode =~ /^(control|unicode|both)$/;
 
 # ── character pools ────────────────────────────────────────────────────────────
@@ -417,30 +417,42 @@ sub transform {
 
 # ── main ───────────────────────────────────────────────────────────────────────
 
-binmode STDOUT, ':raw';
-binmode STDERR, ':raw';
+sub main {
+	binmode STDOUT, ':raw';
+	binmode STDERR, ':raw';
 
-my $src = read_all();
-
-my ( $funcs, $vars ) = collect_identifiers($src);
-
-if ( !keys %$funcs && !keys %$vars ) {
-	print $src;
-	exit 0;
-}
-
-my $map = generate_names( $funcs, $vars );
-my $aname = gen_array_name( $funcs, $vars );
-
-# Report mapping to stderr in readable form (skip if -q)
-if ( !$quiet ) {
-	print STDERR "# obfuscated identifiers (mode=$mode):\n";
-	print STDERR "#   array name: $aname\n";
-	for my $id ( sort keys %$map ) {
-		my $kind = $funcs->{$id} ? "func" : "var ";
-		printf STDERR "#   %s: %-20s -> %s\n", $kind, $id, bytes_to_escape( $map->{$id} );
+	my $file = shift @ARGV;
+	my $fh;
+	if ( defined $file ) {
+		open $fh, '<:raw', $file or die "Cannot open $file: $!\n";
+	} else {
+		$fh = \*STDIN;
 	}
+	my $src = read_all($fh);
+
+	my ( $funcs, $vars ) = collect_identifiers($src);
+
+	if ( !keys %$funcs && !keys %$vars ) {
+		print $src;
+		return 0;
+	}
+
+	my $map = generate_names( $funcs, $vars );
+	my $aname = gen_array_name( $funcs, $vars );
+
+	# Report mapping to stderr in readable form (skip if -q)
+	if ( !$quiet ) {
+		print STDERR "# obfuscated identifiers (mode=$mode):\n";
+		print STDERR "#   array name: $aname\n";
+		for my $id ( sort keys %$map ) {
+			my $kind = $funcs->{$id} ? "func" : "var ";
+			printf STDERR "#   %s: %-20s -> %s\n", $kind, $id, bytes_to_escape( $map->{$id} );
+		}
+	}
+
+	my $out = transform( $src, $funcs, $vars, $map, $aname );
+	print $out;
+	return 0;
 }
 
-my $out = transform( $src, $funcs, $vars, $map, $aname );
-print $out;
+main();
